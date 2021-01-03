@@ -61,6 +61,24 @@ class BaseModel(Base, AbstractConcreteBase):
             instance, is_created = cls.create(**kwargs)
             return instance, is_created
 
+    @classmethod
+    def delete(cls, **kwargs) -> (Base, bool):
+        """
+        Deletes an object from database
+        :param kwargs: any possible parameters
+        :return: deleted object and True if it was successfully deleted else None and False
+        """
+        logging.info(f'{cls.__name__}.delete({kwargs})')
+        session = Session()
+        try:
+            instance = cls.get(**kwargs)
+            session.delete(instance)
+            session.commit()
+            return instance, True
+        except Error:
+            session.rollback()
+            return None, False
+
 
 class User(BaseModel):
     """ A user of the bot """
@@ -223,6 +241,22 @@ class Wish(BaseModel):
             return wish, is_created
         else:
             return None, False
+
+    @staticmethod
+    def delete(user_id: str, game_id: str) -> (Game, bool):
+        """
+        Deletes a record from a wishlist by given user_id and game_id
+        :param user_id: user ID
+        :param game_id: url of the game or its concept ID or product ID
+        :return: instance of the game and flag if it was successfully deleted
+        """
+        user, user_was_created = User.get_or_create(id=user_id)
+        game, game_was_created = Game.get_or_create(game_id=game_id)
+        if not (user_was_created and game_was_created):
+            _, was_deleted = BaseModel.delete(cls=Wish, user_id=user.id, game_id=game.id)
+        else:
+            _, was_deleted = None, False
+        return game, was_deleted
 
 
 BaseModel.metadata.create_all(db)
