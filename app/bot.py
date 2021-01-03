@@ -1,6 +1,16 @@
 """ Script for launching the bot """
 from telebot import TeleBot
 from app.models import Game, Wish
+from PIL import Image
+from io import BytesIO
+from requests import get
+
+import logging
+
+logging.basicConfig(filename='bot.log', filemode='a', level=logging.DEBUG,
+                    format='%(asctime)s.%(msecs)d[%(name)s.%(levelname)s]: %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S')
+logger = logging.getLogger('bot_logger')
 
 bot = TeleBot(token=open('creds/telegram.token').read())
 
@@ -24,7 +34,9 @@ def help_message(message):
 /add — {add_game.__doc__}
 
 /del — {del_game.__doc__}
-    ''', parse_mode='MARKDOWN')
+
+/list — {get_wishlist.__doc__}
+''', parse_mode='MARKDOWN')
 
 
 @bot.message_handler(commands=['add'])
@@ -33,14 +45,23 @@ def add_game(message):
 `/add https://store.playstation.com/ru-ru/concept/10000237`
 или
 `/add 10000237`
-значит добавить в вишлист Assassin's Creed Valhalla """
+добавить в вишлист Assassin's Creed Valhalla """
     try:
         wish, is_created = Wish.get_or_create(user_id=message.chat.id, game_id=message.text.split(' ', maxsplit=1)[1])
-        game_name = Game.get(id=wish.game_id).name
+        game = Game.get(id=wish.game_id)
         if is_created:
-            response = f'Игра успешно добавлена в твой вишлист: {game_name}.'
+            response = f'Игра успешно добавлена в твой вишлист: {game}.'
         else:
-            response = f'Эта игра уже есть в твоём вишлисте: {game_name}.'
+            response = f'Эта игра уже есть в твоём вишлисте: {game}.'
+        if game.poster_url:
+            image_content = get(game.poster_url).content
+            image = Image.open(BytesIO(image_content))
+            image_content = BytesIO()
+            image.seek(0)
+            image.save(image_content, format='JPEG')
+            image_content.seek(0)
+            bot.send_photo(chat_id=message.chat.id, photo=image_content, parse_mode='MARKDOWN', caption=response)
+            return
     except ValueError as ve:
         response = str(ve)
     bot.send_message(message.chat.id, response, parse_mode='MARKDOWN')
@@ -49,23 +70,40 @@ def add_game(message):
 @bot.message_handler(commands=['del'])
 def del_game(message):
     """ удалить игру из вишлиста, пример:
-`/del https://store.playstation.com/ru-ru/concept/10000237`
+`/del https://store.playstation.com/ru-ru/product/EP3862-CUSA10484_00-DEADCELLS0000000`
 или
-`/del 10000237`
-значит удалить из вишлиста Assassin's Creed Valhalla """
+`/del EP3862-CUSA10484_00-DEADCELLS0000000`
+удалить из вишлиста Dead Cells """
+    game_id = message.text.split(' ', maxsplit=1)[1]
     try:
-        game, was_deleted = Wish.delete(user_id=message.chat.id, game_id=message.text.split(' ', maxsplit=1)[1])
+        game, game_is_new = Game.get_or_create(game_id)
+        was_deleted = Wish.delete(user_id=message.chat.id, game_id=game_id)
         if was_deleted:
-            response = f'Игра была успешно удалена: {game.name}'
-        elif game and not was_deleted:
-            response = f'Игра отсутствует в вашем вишлисте: {game.name}'
+            response = f'Игра была успешно удалена: {game}'
+        elif game_is_new or game and not was_deleted:
+            response = f'Игра отсутствует в вашем вишлисте: {game}'
         else:
             response = f'Игра с таким идентификатором не найдена: {game.name}'
-
     except ValueError as ve:
         response = str(ve)
 
     bot.send_message(message.chat.id, response, parse_mode='MARKDOWN')
 
 
-bot.polling(none_stop=True)
+@bot.message_handler(commands=['list'])
+def get_wishlist(message):
+    """просто получить вишлист"""
+    logger.info(f'list: {message.chat.username}: {message.text}')
+    wishlist = Wish.get_all(user_id=message.chat.id)
+    logger.debug(f'list: {wishlist}')
+    games = [Game.get(id=wish.game_id) for wish in wishlist]
+    logger.debug(f'list: games_len — {len(games)}')
+    bot.send_message(
+        chat_id=message.chat.id,
+        text='\n'.join([f'{i}) {game}' for i, game in enumerate(sorted(games, key=lambda x: x.name), start=1)]),
+        parse_mode='MARKDOWN'
+    )
+
+
+if __name__ == '__main__':
+    bot.polling()

@@ -1,10 +1,10 @@
 """ File with basic DB models for the bot"""
 from json import loads
 from re import fullmatch
-from sqlite3 import Error
+from sqlalchemy.exc import IntegrityError
 from bs4 import BeautifulSoup as Soup
 from requests import get
-from sqlalchemy import create_engine, Column, String, ForeignKey
+from sqlalchemy import create_engine, Column, String, ForeignKey, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base, AbstractConcreteBase
 from sqlalchemy.orm import sessionmaker
 from urllib3.util import parse_url
@@ -12,7 +12,12 @@ from uuid import uuid4
 
 import logging
 
-db = create_engine('sqlite:///psnbot.sqlite', echo=True)
+logging.basicConfig(filename='bot.log', filemode='a', level=logging.DEBUG,
+                    format='%(asctime)s.%(msecs)d[%(name)s.%(levelname)s]: %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S')
+logger = logging.getLogger('back')
+
+db = create_engine('sqlite:///psnbot.sqlite', echo=False)
 Base = declarative_base(bind=db)
 Session = sessionmaker(bind=db)
 
@@ -26,22 +31,30 @@ class BaseModel(Base, AbstractConcreteBase):
     @classmethod
     def get(cls, **kwargs):
         """ Get a model object by given parameters """
-        logging.info(f'{cls.__name__}.get({kwargs})')
-        session = Session()
+        logger.info(f'{cls.__name__}.get({kwargs})')
+        session = Session(expire_on_commit=False)
         return session.query(cls).filter_by(**kwargs).one_or_none()
+
+    @classmethod
+    def get_all(cls, **kwargs):
+        """ Get all the objects that fits given parameters """
+        logger.info(f'{cls.__name__}.get_all({kwargs}')
+        session = Session(expire_on_commit=False)
+        return session.query(cls).filter_by(**kwargs).all()
 
     @classmethod
     def create(cls, **kwargs: object) -> (Base, bool):
         """ Create a model object with given parameters
         """
-        logging.info(f'{cls.__name__}.create({kwargs})')
+        logger.info(f'{cls.__name__}.create({kwargs})')
         session = Session()
         try:
             instance = cls(**kwargs)
             session.add(instance)
             session.commit()
             return instance, True
-        except Error:
+        except IntegrityError as e:
+            logging.error(e.message if hasattr(e, 'message') else str(e))
             session.rollback()
             instance = session.query(cls).filter_by(**kwargs).one()
             return instance, False
@@ -50,10 +63,10 @@ class BaseModel(Base, AbstractConcreteBase):
     def get_or_create(cls, **kwargs) -> (Base, bool):
         """
         Query the table using given parameters
-        :param kwargs: any parameters supported for given model
+        :param kwargs: specific for each model
         :return: tuple the object of given model with flag if the object was created
         """
-        logging.info(f'{cls.__name__}:get_or_create({kwargs})')
+        logger.info(f'{cls.__name__}:get_or_create({kwargs})')
         instance = cls.get(**kwargs)
         if instance:
             return instance, False
@@ -62,22 +75,21 @@ class BaseModel(Base, AbstractConcreteBase):
             return instance, is_created
 
     @classmethod
-    def delete(cls, **kwargs) -> (Base, bool):
+    def delete(cls, **kwargs) -> bool:
         """
         Deletes an object from database
         :param kwargs: any possible parameters
-        :return: deleted object and True if it was successfully deleted else None and False
+        :return: True if it was successfully deleted else False
         """
-        logging.info(f'{cls.__name__}.delete({kwargs})')
-        session = Session()
+        logger.debug(f'{cls}.delete({kwargs})')
+        session = Session(expire_on_commit=False)
         try:
-            instance = cls.get(**kwargs)
-            session.delete(instance)
+            session.query(cls).filter(**kwargs).delete()
             session.commit()
-            return instance, True
-        except Error:
+            return True
+        except IntegrityError:
             session.rollback()
-            return None, False
+            return False
 
 
 class User(BaseModel):
@@ -113,9 +125,10 @@ class Game(BaseModel):
             :param html_page: BeautifulSoup, parsed as BeautifulSoup page
             :return: tuple (concept_id, product_id and banner_url)
             """
-            logging.info(f'Game.get_game_info.get_poster_url({html_page.select_one("title").text})')
+            logger.info(f'Game.get_game_info.get_poster_url({html_page.select_one("title").text})')
             scripts = html_page.select('script[type="application/json"]')
             scripts = [loads(script.contents[0]) for script in scripts]
+            logger.info(f'Game.get_game_info.get_poster_url len of scripts: {len(scripts)}')
             game_concept_id = ''
             game_product_id = ''
             media = []
@@ -134,12 +147,12 @@ class Game(BaseModel):
                 else:
                     continue
                 break
-
+            logger.info(f'Game.get_game_info.get_poster_url ids: {game_product_id, game_concept_id}')
             return game_concept_id, game_product_id, next(
                 image for image in media if image['type'] == 'IMAGE' and image['role'] == 'MASTER'
             )['url']
 
-        logging.info(f'Game.get_game_info({concept_id, product_id, game_url, store_locale})')
+        logger.info(f'Game.get_game_info({concept_id, product_id, game_url, store_locale})')
         if not (product_id or concept_id or game_url):
             raise ValueError('There is at least one of concept_id, product_ or game_url arguments needed.')
 
@@ -152,27 +165,29 @@ class Game(BaseModel):
             markup=get(url=game_url).text.replace(u'\xa0', u''),
             features='html.parser'
         )
-        try:
-            concept_id, product_id, poster_url = get_poster_url(html_page=game_page)
-            game_info = {
-                'product_id': product_id,
-                'concept_id': concept_id,
-                'valid_until': game_page.select('span[class*="psw-body-2"]')[1].text,
-                'discount_info': game_page.select('span[class*="psw-body-2"]')[0].text,
-                'name': game_page.select_one('h1').text,
-                'poster_url': poster_url,
-                'sale_price': game_page.select_one('div[data-mfe-name="ctaWithPrice"] span[class*="psw-h3"]').text,
-                'original_price': game_page.select_one('div[data-mfe-name="ctaWithPrice"] span[class*="psw-h4"]').text,
-                'editions': [
-                    {
-                        'edition': edition_description.select_one('h3').text,
-                        'sale_price': edition_description.select_one('span[class*="psw-h3"]').text,
-                        'original_price': edition_description.select_one('span[class*="psw-h4"]').text
-                    } for edition_description in game_page.select('article[class*="psw-cell"]')
-                ]
-            }
-        except (IndexError, StopIteration):
-            return {}
+
+        concept_id, product_id, poster_url = get_poster_url(html_page=game_page)
+        logger.debug(f'Game.get_game_info concept_id, product_id, poster_url: {concept_id, product_id, poster_url}')
+        game_info = {
+            'product_id': product_id,
+            'concept_id': concept_id,
+            'valid_until': getattr((game_page.select('span[class*="psw-body-2"]') or [None])[-1], 'text', None),
+            'discount_info': getattr(game_page.select_one('span[class*="psw-body-2"]'), 'text', None),
+            'name': game_page.select_one('h1').text,
+            'poster_url': poster_url,
+            'sale_price': getattr(
+                game_page.select_one('div[data-mfe-name="ctaWithPrice"] span[class*="psw-h3"]'), 'text', None),
+            'original_price': getattr(
+                game_page.select_one('div[data-mfe-name="ctaWithPrice"] span[class*="psw-h4"]'), 'text', None),
+            'editions': [
+                {
+                    'edition': edition_description.select_one('h3').text,
+                    'sale_price': getattr(edition_description.select_one('span[class*="psw-h3"]'), 'text', None),
+                    'original_price': getattr(edition_description.select_one('span[class*="psw-h4"]'), 'text', None)
+                } for edition_description in game_page.select('article[class*="psw-cell"]')
+            ]
+        }
+
         return game_info
 
     @staticmethod
@@ -181,9 +196,10 @@ class Game(BaseModel):
         Check the correctness of game_id and then check if the game exists in the store.
         :param game_id: url of the game or game ID from PSN store
         """
-        logging.info(f'Game.get_or_create({game_id})')
+        logger.debug(f'Game.get_or_create({game_id})')
 
         if not fullmatch(r'\d+|[\d\w-]+', game_id):
+            logger.debug(msg=f'Game.get_or_create not full matched: {game_id}')
             game_url = parse_url(game_id)
             if game_url.host != 'store.playstation.com' or not fullmatch(
                     r'/[a-z\-]+/(concept/\d+|product/[\w\d-]+)',
@@ -201,29 +217,46 @@ class Game(BaseModel):
 
         game = Game.get(**{id_type: game_id})
         if game:
+            logger.debug(f'Game.get_or_create game already exists: {game_id, game.name}')
             return game, False
 
         game_info = Game.get_game_info(concept_id=game_id) if game_id.isnumeric() \
             else Game.get_game_info(product_id=game_id)
 
-        if game_info:
-            game, is_created = Game.create(
-                product_id=game_info.get('product_id'),
-                concept_id=game_info.get('concept_id'),
-                name=game_info['name'],
-                poster_url=game_info.get('poster_url')
-            )
-            return game, is_created
+        logger.debug(f'Game.get_or_create game_info recieved: {game_info}')
+        game = Game.get(concept_id=game_info.get('concept_id'))
+        if game is None:
+            if game_info:
+                game, game_was_created = Game.create(
+                    product_id=game_info.get('product_id'),
+                    concept_id=game_info.get('concept_id'),
+                    name=game_info['name'],
+                    poster_url=game_info.get('poster_url')
+                )
+                return game, game_was_created
+            else:
+                raise ValueError('Введён несуществующий идентификатор игры. Его можно найти после `/product/` или'
+                                 '`/concept/` в url на сайте PSN Store')
         else:
-            raise ValueError('Введён несуществующий идентификатор игры. Его можно найти после `/product/` или'
-                             '`/concept/` в url на сайте PSN Store')
+            sess = Session()
+            sess.query(Game).filter(
+                Game.concept_id == game.concept_id
+            ).update(
+                {Game.name: min([game.name, game_info.get('name', '')], key=len)}
+            )
+            sess.commit()
+            return game, False
+
+    def __str__(self):
+        return f'[{self.name}](https://store.playstation.com/ru-ru/concept/{self.concept_id}/)'
 
 
 class Wish(BaseModel):
     """ A record that describes a game that a user wants to purchase """
     __tablename__ = 'wishes'
-    user_id = Column(String, ForeignKey('users.id'))
-    game_id = Column(String, ForeignKey('games.id'))
+    user_id = Column(String, ForeignKey('users.id', onupdate="CASCADE", ondelete="CASCADE"))
+    game_id = Column(String, ForeignKey('games.id', onupdate="CASCADE", ondelete="CASCADE"))
+    gu = UniqueConstraint(game_id, user_id)
 
     @staticmethod
     def get_or_create(user_id: str, game_id: str) -> (Base, bool):
@@ -233,7 +266,7 @@ class Wish(BaseModel):
         :param game_id: product ID or concept ID or game url
         :returns (Wish, flag if object was created)
         """
-        logging.info(f'Wish.get_or_create({user_id, game_id})')
+        logger.debug(f'Wish.get_or_create({user_id, game_id})')
         user, is_created = User.get_or_create(id=user_id)
         game, is_created = Game.get_or_create(game_id=game_id)
         if game:
@@ -243,7 +276,7 @@ class Wish(BaseModel):
             return None, False
 
     @staticmethod
-    def delete(user_id: str, game_id: str) -> (Game, bool):
+    def delete(user_id, game_id) -> bool:
         """
         Deletes a record from a wishlist by given user_id and game_id
         :param user_id: user ID
@@ -252,11 +285,13 @@ class Wish(BaseModel):
         """
         user, user_was_created = User.get_or_create(id=user_id)
         game, game_was_created = Game.get_or_create(game_id=game_id)
-        if not (user_was_created and game_was_created):
-            _, was_deleted = BaseModel.delete(cls=Wish, user_id=user.id, game_id=game.id)
+        if not (user_was_created or game_was_created):
+            sess = Session()
+            was_deleted = sess.query(Wish).filter(Wish.user_id == user.id, Wish.game_id == game.id).delete()
+            sess.commit()
         else:
-            _, was_deleted = None, False
-        return game, was_deleted
+            was_deleted = None, False
+        return was_deleted
 
 
 BaseModel.metadata.create_all(db)
