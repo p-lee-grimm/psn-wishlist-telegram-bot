@@ -165,7 +165,6 @@ class Game(BaseModel):
             markup=get(url=game_url).text.replace(u'\xa0', u''),
             features='html.parser'
         )
-
         concept_id, product_id, poster_url = get_poster_url(html_page=game_page)
         logger.debug(f'Game.get_game_info concept_id, product_id, poster_url: {concept_id, product_id, poster_url}')
         game_info = {
@@ -219,11 +218,13 @@ class Game(BaseModel):
         if game:
             logger.debug(f'Game.get_or_create game already exists: {game_id, game.name}')
             return game, False
-
-        game_info = Game.get_game_info(concept_id=game_id) if game_id.isnumeric() \
-            else Game.get_game_info(product_id=game_id)
-
-        logger.debug(f'Game.get_or_create game_info recieved: {game_info}')
+        try:
+            game_info = Game.get_game_info(concept_id=game_id) if game_id.isnumeric() \
+                else Game.get_game_info(product_id=game_id)
+        except (StopIteration, ValueError) as e:
+            raise ValueError('Введён несуществующий идентификатор игры. Его можно найти после `/product/` или'
+                             '`/concept/` в url на сайте PSN Store')
+        logger.debug(f'Game.get_or_create game_info received: {game_info}')
         game = Game.get(concept_id=game_info.get('concept_id'))
         if game is None:
             if game_info:

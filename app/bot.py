@@ -1,5 +1,5 @@
 """ Script for launching the bot """
-from telebot import TeleBot
+from telebot import TeleBot, types
 from app.models import Game, Wish
 from PIL import Image
 from io import BytesIO
@@ -13,6 +13,21 @@ logging.basicConfig(filename='bot.log', filemode='a', level=logging.DEBUG,
 logger = logging.getLogger('bot_logger')
 
 bot = TeleBot(token=open('creds/telegram.token').read())
+
+
+def get_image_bytes(img_url: str) -> BytesIO:
+    """
+    Get image by url and make a BytesIO object with it
+    :param img_url:
+    :returns BytesIO object
+    """
+    image_content = get(img_url).content
+    image = Image.open(BytesIO(image_content))
+    image_content = BytesIO()
+    image.seek(0)
+    image.save(image_content, format='JPEG')
+    image_content.seek(0)
+    return image_content
 
 
 @bot.message_handler(commands=['start'])
@@ -54,13 +69,10 @@ def add_game(message):
         else:
             response = f'Эта игра уже есть в твоём вишлисте: {game}.'
         if game.poster_url:
-            image_content = get(game.poster_url).content
-            image = Image.open(BytesIO(image_content))
-            image_content = BytesIO()
-            image.seek(0)
-            image.save(image_content, format='JPEG')
-            image_content.seek(0)
-            bot.send_photo(chat_id=message.chat.id, photo=image_content, parse_mode='MARKDOWN', caption=response)
+            bot.send_photo(chat_id=message.chat.id,
+                           photo=get_image_bytes(game.poster_url),
+                           parse_mode='MARKDOWN',
+                           caption=response)
             return
     except ValueError as ve:
         response = str(ve)
@@ -93,16 +105,48 @@ def del_game(message):
 @bot.message_handler(commands=['list'])
 def get_wishlist(message):
     """просто получить вишлист"""
-    logger.info(f'list: {message.chat.username}: {message.text}')
     wishlist = Wish.get_all(user_id=message.chat.id)
-    logger.debug(f'list: {wishlist}')
     games = [Game.get(id=wish.game_id) for wish in wishlist]
-    logger.debug(f'list: games_len — {len(games)}')
+    if games:
+        response = '\n'.join([f'{i}) {game}' for i, game in enumerate(sorted(games, key=lambda x: x.name), start=1)])
+    else:
+        response = 'Твой вишлист пуст :('
     bot.send_message(
         chat_id=message.chat.id,
-        text='\n'.join([f'{i}) {game}' for i, game in enumerate(sorted(games, key=lambda x: x.name), start=1)]),
+        text=response,
         parse_mode='MARKDOWN'
     )
+
+
+@bot.inline_handler(func=lambda query: True)
+def watch_wishlist_inline(chosen_inline_result):
+    """
+    Inline
+    :param chosen_inline_result:
+    """
+    try:
+        wishes = Wish.get_all(user_id=chosen_inline_result.from_user.id)
+        games = [Game.get(id=wish.game_id) for wish in wishes]
+
+        bot.answer_inline_query(
+            inline_query_id=chosen_inline_result.id,
+            results=[
+                types.InlineQueryResultPhoto(
+                    id=game.id,
+                    title=game.name,
+                    photo_url=game.poster_url,
+                    thumb_url=game.poster_url,
+                    caption=str(game),
+                    parse_mode='MARKDOWN',
+                    input_message_content=types.InputMediaPhoto(caption=str(game),
+                                                                parse_mode='MARKDOWN',
+                                                                media=get_image_bytes(game.poster_url)),
+                ) for i, game in enumerate(sorted(games, key=lambda x: x.name))],
+            switch_pm_text='Добавить игр?',
+            switch_pm_parameter=''
+        )
+    except Exception as e:
+        print(e)
 
 
 if __name__ == '__main__':
