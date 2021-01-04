@@ -121,7 +121,7 @@ def get_wishlist(message):
 @bot.inline_handler(func=lambda query: True)
 def watch_wishlist_inline(chosen_inline_result):
     """
-    Inline
+    inline-метод, позволяющий публиковать в чате игры из своего вишлиста
     :param chosen_inline_result:
     """
     try:
