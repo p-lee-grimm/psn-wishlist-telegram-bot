@@ -4,22 +4,35 @@ from re import fullmatch
 from sqlalchemy.exc import IntegrityError
 from bs4 import BeautifulSoup as Soup
 from requests import get
-from sqlalchemy import create_engine, Column, String, ForeignKey, UniqueConstraint
+from sqlalchemy import create_engine, Column, Integer, String, Date, ForeignKey, UniqueConstraint, or_
 from sqlalchemy.ext.declarative import declarative_base, AbstractConcreteBase
 from sqlalchemy.orm import sessionmaker
 from urllib3.util import parse_url
 from uuid import uuid4
+from contextlib import contextmanager
+from datetime import date, datetime as dt
 
 import logging
-
-logging.basicConfig(filename='bot.log', filemode='a', level=logging.DEBUG,
-                    format='%(asctime)s.%(msecs)d[%(name)s.%(levelname)s]: %(message)s',
-                    datefmt='%Y-%m-%d %H:%M:%S')
-logger = logging.getLogger('back')
 
 db = create_engine('sqlite:///psnbot.sqlite', echo=False)
 Base = declarative_base(bind=db)
 Session = sessionmaker(bind=db)
+
+PSN_URL = 'store.playstation.com'
+
+
+@contextmanager
+def session_scope():
+    """Provide a transactional scope around a series of operations."""
+    session = Session()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 class BaseModel(Base, AbstractConcreteBase):
@@ -29,67 +42,72 @@ class BaseModel(Base, AbstractConcreteBase):
     id = Column(String, primary_key=True, default=lambda: str(uuid4()))
 
     @classmethod
-    def get(cls, **kwargs):
+    def logger(cls):
+        """
+        Log a message with a given level 
+        """
+        logging.basicConfig(
+            filename='bot.log',
+            filemode='a',
+            level=logging.DEBUG,
+            format='%(asctime)s.%(msecs)d[%(name)s.%(levelname)s]: '
+                   '[%(filename)s:%(lineno)s - %(funcName)20s() ] '
+                   '%(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S')
+        return logging.getLogger(cls.__name__)
+
+    @classmethod
+    def get(cls, session: Session, **kwargs):
         """ Get a model object by given parameters """
-        logger.info(f'{cls.__name__}.get({kwargs})')
-        session = Session(expire_on_commit=False)
+        cls.logger().info(f'{kwargs}')
         return session.query(cls).filter_by(**kwargs).one_or_none()
 
     @classmethod
-    def get_all(cls, **kwargs):
+    def get_all(cls, session: Session, **kwargs):
         """ Get all the objects that fits given parameters """
-        logger.info(f'{cls.__name__}.get_all({kwargs}')
-        session = Session(expire_on_commit=False)
+        cls.logger().info(f'{kwargs}')
         return session.query(cls).filter_by(**kwargs).all()
 
     @classmethod
-    def create(cls, **kwargs: object) -> (Base, bool):
+    def create(cls, session: Session, **kwargs) -> (Base, bool):
         """ Create a model object with given parameters
+        :returns tuple with created object and True if the object was created else False
         """
-        logger.info(f'{cls.__name__}.create({kwargs})')
-        session = Session()
-        try:
+        cls.logger().info(f'{kwargs}')
+        instance = session.query(cls).filter_by(**kwargs).one_or_none()
+        if not instance:
             instance = cls(**kwargs)
             session.add(instance)
-            session.commit()
-            return instance, True
-        except IntegrityError as e:
-            logging.error(e.message if hasattr(e, 'message') else str(e))
-            session.rollback()
-            instance = session.query(cls).filter_by(**kwargs).one()
-            return instance, False
+            was_created = True
+        else:
+            was_created = False
+        return instance, was_created
 
     @classmethod
-    def get_or_create(cls, **kwargs) -> (Base, bool):
+    def get_or_create(cls, session: Session, **kwargs) -> (Base, bool):
         """
         Query the table using given parameters
+        :param session: Session instance
         :param kwargs: specific for each model
         :return: tuple the object of given model with flag if the object was created
         """
-        logger.info(f'{cls.__name__}:get_or_create({kwargs})')
-        instance = cls.get(**kwargs)
+        cls.logger().info(f'{cls.__name__}:get_or_create({kwargs})')
+        instance = cls.get(session=session, **kwargs)
         if instance:
             return instance, False
         else:
-            instance, is_created = cls.create(**kwargs)
+            instance, is_created = cls.create(session=session, **kwargs)
             return instance, is_created
 
     @classmethod
-    def delete(cls, **kwargs) -> bool:
+    def delete(cls, session: Session, **kwargs):
         """
         Deletes an object from database
+        :param session: Session instance
         :param kwargs: any possible parameters
-        :return: True if it was successfully deleted else False
         """
-        logger.debug(f'{cls}.delete({kwargs})')
-        session = Session(expire_on_commit=False)
-        try:
-            session.query(cls).filter(**kwargs).delete()
-            session.commit()
-            return True
-        except IntegrityError:
-            session.rollback()
-            return False
+        cls.logger().debug(f'{cls}.delete({kwargs})')
+        session.query(cls).filter(**kwargs).delete()
 
 
 class User(BaseModel):
@@ -119,134 +137,132 @@ class Game(BaseModel):
         :returns dict with information about a game from PSN store or None if the game does not exist
         """
 
-        def get_poster_url(html_page: Soup) -> tuple[str, str, str]:
-            """
-            Get game poster's url, product and concept IDs.
-            :param html_page: BeautifulSoup, parsed as BeautifulSoup page
-            :return: tuple (concept_id, product_id and banner_url)
-            """
-            logger.info(f'Game.get_game_info.get_poster_url({html_page.select_one("title").text})')
-            scripts = html_page.select('script[type="application/json"]')
-            scripts = [loads(script.contents[0]) for script in scripts]
-            logger.info(f'Game.get_game_info.get_poster_url len of scripts: {len(scripts)}')
-            game_concept_id = ''
-            game_product_id = ''
-            media = []
-            for script in scripts:
-                args = script.get('args', [])
-                if 'conceptId' in args:
-                    game_concept_id = args['conceptId']
-                    game_product_id = script['cache'][next(k for k in script['cache'] if k.startswith('Product:'))][
-                        'id']
-                    media = script['cache'][f'Product:{game_product_id}']['media']
-                elif 'productId' in args:
-                    game_product_id = args['productId']
-                    game_concept_id = script['cache'][next(k for k in script['cache'] if k.startswith('Concept:'))][
-                        'id']
-                    media = script['cache'][f'Concept:{game_concept_id}']['media']
-                else:
-                    continue
-                break
-            logger.info(f'Game.get_game_info.get_poster_url ids: {game_product_id, game_concept_id}')
-            return game_concept_id, game_product_id, next(
-                image for image in media if image['type'] == 'IMAGE' and image['role'] == 'MASTER'
-            )['url']
-
-        logger.info(f'Game.get_game_info({concept_id, product_id, game_url, store_locale})')
+        Game.logger().info(f'{concept_id, product_id, game_url, store_locale}')
         if not (product_id or concept_id or game_url):
             raise ValueError('There is at least one of concept_id, product_ or game_url arguments needed.')
 
         if concept_id:
-            game_url = f'''https://store.playstation.com/{store_locale}/concept/{concept_id}'''
+            game_url = f'''https://{PSN_URL}/{store_locale}/concept/{concept_id}'''
         elif product_id:
-            game_url = f'''https://store.playstation.com/{store_locale}/product/{product_id}'''
+            game_url = f'''https://{PSN_URL}/{store_locale}/product/{product_id}'''
 
         game_page = Soup(
             markup=get(url=game_url).text.replace(u'\xa0', u''),
             features='html.parser'
         )
-        concept_id, product_id, poster_url = get_poster_url(html_page=game_page)
-        logger.debug(f'Game.get_game_info concept_id, product_id, poster_url: {concept_id, product_id, poster_url}')
-        game_info = {
-            'product_id': product_id,
-            'concept_id': concept_id,
-            'valid_until': getattr((game_page.select('span[class*="psw-body-2"]') or [None])[-1], 'text', None),
-            'discount_info': getattr(game_page.select_one('span[class*="psw-body-2"]'), 'text', None),
-            'name': game_page.select_one('h1').text,
-            'poster_url': poster_url,
-            'sale_price': getattr(
-                game_page.select_one('div[data-mfe-name="ctaWithPrice"] span[class*="psw-h3"]'), 'text', None),
-            'original_price': getattr(
-                game_page.select_one('div[data-mfe-name="ctaWithPrice"] span[class*="psw-h4"]'), 'text', None),
-            'editions': [
-                {
-                    'edition': edition_description.select_one('h3').text,
-                    'sale_price': getattr(edition_description.select_one('span[class*="psw-h3"]'), 'text', None),
-                    'original_price': getattr(edition_description.select_one('span[class*="psw-h4"]'), 'text', None)
-                } for edition_description in game_page.select('article[class*="psw-cell"]')
-            ]
+
+        data = game_page.select_one('div[class="pdp-upsells script"]')
+        if data is None:
+            data = game_page.select_one('div[class="pdp-cta"] script')
+        data = loads(next(data.children))['cache']
+
+        concept_id = concept_id or next(key for key in data if key.startswith('Concept:')).replace('Concept:', '')
+
+        id_name = {
+            f'''GameCTA:{
+                v.get(
+                    'activeCtaId', 
+                    v.get('webctas', v['skus'])[0]['__ref'].replace('Sku', '').replace('GameCTA', '')
+                )
+            }''':
+                v.get('edition', v)['name'] for k, v in data.items() \
+            if k.startswith('Product')
         }
+
+        id_data = {
+            edition_name: {
+                'original_price': data[id_]['local']['telemetryMeta']['skuDetail']['skuPriceDetail'][0][
+                                      'originalPriceValue'] // 100,
+                'sale_price': data[id_]['local']['telemetryMeta']['skuDetail']['skuPriceDetail'][0][
+                                  'discountPriceValue'] // 100,
+                'valid_until': dt.fromtimestamp(int(data[id_]['price']['endTime'] or 10 ** 14) // 1000),
+                'currency': data[id_]['price']['currencyCode']
+            } for id_, edition_name in id_name.items() if id_ in data
+        }
+
+        concept_info = data[f'Concept:{concept_id}']
+        if 'media' not in concept_info:
+            concept_info = loads(
+                Soup(loads(game_page.select_one('#__NEXT_DATA__').next
+                           )['props']['pageProps']['batarangs']['background-image']['text'],
+                     'html.parser'
+                     ).script.next
+            )['cache'][f'Concept:{concept_id}']
+        product_info = next(v for k, v in data.items() if k.startswith('Product'))
+
+        game_info = {
+            'name': concept_info.get('name', product_info['name']),
+            'poster_url': next(x['url'] for x in concept_info['media'] if x['role'] == 'MASTER'),
+            'editions': id_data,
+            'concept_id': concept_id,
+        }
+
+        Game.logger().debug(
+            f'''concept_id, poster_url: {concept_id, game_info['poster_url']}''')
 
         return game_info
 
     @staticmethod
-    def get_or_create(game_id: str) -> (Base, bool):
+    def get_or_create(session: Session, **kwargs) -> (BaseModel, bool):
         """
         Check the correctness of game_id and then check if the game exists in the store.
-        :param game_id: url of the game or game ID from PSN store
+        :param session: Session instance
+        :param kwargs: should include game_id param
+        :returns Game object and True if it was successfully created else False
         """
-        logger.debug(f'Game.get_or_create({game_id})')
-
+        Game.logger().debug(f'({kwargs})')
+        game_id = kwargs['game_id']
         if not fullmatch(r'\d+|[\d\w-]+', game_id):
-            logger.debug(msg=f'Game.get_or_create not full matched: {game_id}')
+            Game.logger().debug(msg=f'not full matched: {game_id}')
             game_url = parse_url(game_id)
-            if game_url.host != 'store.playstation.com' or not fullmatch(
+            if game_url.host != PSN_URL or not fullmatch(
                     r'/[a-z\-]+/(concept/\d+|product/[\w\d-]+)',
                     game_url.path):
-                raise ValueError('''Неверный url. Правильный url выглядит так:
+                raise ValueError(f'''Неверный url. Правильный url выглядит так:
                                  ```
-                                 [http(s)://]store.playstation.com/{\
-                                 локаль магазина вроде ru-ru}/(concept|product)/{идентификатор игры}
-                                 ```''')
+                                 [http(s)://]{PSN_URL}/[локаль магазина вроде ru-ru]/(concept|product)/[идентификатор 
+                                 игры] ```''')
             game_id = game_url.path.split('/')[-1]
         if game_id.isnumeric():
             id_type = 'concept_id'
         else:
             id_type = 'product_id'
 
-        game = Game.get(**{id_type: game_id})
+        game = Game.get(**{id_type: game_id}, session=session)
         if game:
-            logger.debug(f'Game.get_or_create game already exists: {game_id, game.name}')
+            Game.logger().debug(f'Game.get_or_create game already exists: {game_id, game.name}')
             return game, False
         try:
             game_info = Game.get_game_info(concept_id=game_id) if game_id.isnumeric() \
                 else Game.get_game_info(product_id=game_id)
-        except (StopIteration, ValueError) as e:
+        except (StopIteration, ValueError):
             raise ValueError('Введён несуществующий идентификатор игры. Его можно найти после `/product/` или'
                              '`/concept/` в url на сайте PSN Store')
-        logger.debug(f'Game.get_or_create game_info received: {game_info}')
-        game = Game.get(concept_id=game_info.get('concept_id'))
+        Game.logger().debug(f'game_info received: {game_info}')
+        game = Game.get(concept_id=game_info.get('concept_id'), session=session)
         if game is None:
             if game_info:
                 game, game_was_created = Game.create(
                     product_id=game_info.get('product_id'),
                     concept_id=game_info.get('concept_id'),
                     name=game_info['name'],
-                    poster_url=game_info.get('poster_url')
+                    poster_url=game_info.get('poster_url'),
+                    session=session
                 )
+
+                Price.update_price(game_id=game.id, game_info=game_info, session=session)
                 return game, game_was_created
             else:
                 raise ValueError('Введён несуществующий идентификатор игры. Его можно найти после `/product/` или'
-                                 '`/concept/` в url на сайте PSN Store')
+                                 f'`/concept/` в url на сайте PSN Store: {PSN_URL}')
         else:
-            sess = Session()
-            sess.query(Game).filter(
-                Game.concept_id == game.concept_id
-            ).update(
-                {Game.name: min([game.name, game_info.get('name', '')], key=len)}
-            )
-            sess.commit()
-            return game, False
+            with session_scope() as sess:
+                sess.query(Game).filter(
+                    Game.concept_id == game.concept_id
+                ).update(
+                    {Game.name: min([game.name, game_info.get('name', '')], key=len)}
+                )
+                return game, False
 
     def __str__(self):
         return f'[{self.name}](https://store.playstation.com/ru-ru/concept/{self.concept_id}/)'
@@ -260,39 +276,103 @@ class Wish(BaseModel):
     gu = UniqueConstraint(game_id, user_id)
 
     @staticmethod
-    def get_or_create(user_id: str, game_id: str) -> (Base, bool):
+    def get_or_create(session: Session = None, **kwargs) -> (Base, bool):
         """
         Creates a record in a wishlist of a given user
-        :param user_id: user ID
-        :param game_id: product ID or concept ID or game url
+        :param session: Session instance
+        :param kwargs: should include at least user_id (url or concept ID or product ID of the game) and game_id
         :returns (Wish, flag if object was created)
         """
-        logger.debug(f'Wish.get_or_create({user_id, game_id})')
-        user, is_created = User.get_or_create(id=user_id)
-        game, is_created = Game.get_or_create(game_id=game_id)
+        user_id = kwargs['user_id']
+        game_id = kwargs['game_id']
+        session = session or Session()
+        Game.logger().debug(f'Wish.get_or_create({user_id, game_id})')
+        user, is_created = User.get_or_create(id=user_id, session=session)
+        game, is_created = Game.get_or_create(game_id=game_id, session=session)
         if game:
-            wish, is_created = Wish.create(user_id=user.id, game_id=game.id)
+            try:
+                wish, is_created = Wish.create(user_id=user.id, game_id=game.id, session=session)
+            except (IntegrityError,):
+                is_created = False
+                wish = None
             return wish, is_created
         else:
             return None, False
 
     @staticmethod
-    def delete(user_id, game_id) -> bool:
+    def delete(session: Session, **kwargs) -> bool:
         """
         Deletes a record from a wishlist by given user_id and game_id
-        :param user_id: user ID
-        :param game_id: url of the game or its concept ID or product ID
+        :param session:
+        :param kwargs: should include user_id and game_id
         :return: instance of the game and flag if it was successfully deleted
         """
-        user, user_was_created = User.get_or_create(id=user_id)
-        game, game_was_created = Game.get_or_create(game_id=game_id)
+        user_id = kwargs['user_id']
+        game_id = kwargs['game_id']
+
+        user, user_was_created = User.get_or_create(id=user_id, session=session)
+        game, game_was_created = Game.get_or_create(game_id=game_id, session=session)
         if not (user_was_created or game_was_created):
-            sess = Session()
-            was_deleted = sess.query(Wish).filter(Wish.user_id == user.id, Wish.game_id == game.id).delete()
-            sess.commit()
+            was_deleted = session.query(Wish).filter(Wish.user_id == user.id, Wish.game_id == game.id).delete()
         else:
             was_deleted = None, False
         return was_deleted
+
+
+class Price(BaseModel):
+    """ A record with a price of a game at specific day """
+    __tablename__ = 'prices'
+    game_id = Column(String, ForeignKey('games.id', onupdate="CASCADE", ondelete="CASCADE"))
+    check_date = Column(Date, nullable=False)
+    locale = Column(String, default='ru-ru', nullable=False)
+    original_price = Column(Integer, nullable=False)
+    sale_price = Column(Integer, nullable=True)
+    valid_until = Column(Date, nullable=True)
+    edition = Column(String, nullable=True)
+    currency = Column(String, nullable=True, default='RUB')
+
+    game_date_locale_edition = UniqueConstraint(game_id, check_date, locale, edition)
+
+    @staticmethod
+    def update_price(game_id: str, session: Session, locale: str = 'ru-ru', game_info: dict = None):
+        """
+        Get current price of a given game
+        :param session: Session instance
+        :param game_info: dict with game info if already uploaded, empty by default
+        :param locale: locale of the shop, ru-ru as default
+        :param game_id: game ID
+        """
+        Price.logger().info(f'{game_id, locale, game_info}')
+
+        game = Game.get(session=session, id=game_id)
+        game_info = game_info or Game.get_game_info(concept_id=game.concept_id, store_locale=locale)
+        common_game_info = dict(
+            game_id=game_id,
+            check_date=date.today(),
+            locale=locale,
+        )
+        print(game_info)
+        for edition_name, edition_info in game_info['editions'].items():
+            print(edition_info, common_game_info)
+            price_record = Price(edition=edition_name, **edition_info, **common_game_info)
+            session.merge(price_record)
+
+    @staticmethod
+    def update_prices():
+        """
+        Update all prices of the games that have non-actual prices
+        """
+        Game.logger().info('nothing special')
+        with session_scope() as sess:
+            for game_id, in sess.query(Game).outerjoin(Price).filter(
+                    or_(
+                        Price.check_date < date.today(),
+                        Price.check_date == None
+                    )
+            ).distinct().values(Game.id):
+                print(game_id)
+                Price.update_price(game_id=game_id, session=sess)
+        print('''That's all!''')
 
 
 BaseModel.metadata.create_all(db)
